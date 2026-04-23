@@ -1,0 +1,417 @@
+--// Desyns - Pure Desync System
+--// Single System: Invisibility Only | No Speed Modification
+
+local players = game:GetService("Players")
+local rs = game:GetService("RunService")
+local lp = players.LocalPlayer
+local ts = game:GetService("TweenService")
+
+--// FR HUB Libraries
+local rnet = getgenv().rnet
+local delta = getgenv().delta
+
+--// State
+local desyncActive = false
+local ghostModel = nil
+local groundParts = {}
+local attachments = {}
+local vfxConn = nil
+local desyncConn = nil
+local staticPos = nil
+local serverPos = nil
+
+--// Config
+local DESYNC_INTERVAL = 0.015
+
+--// VFX Constants
+local PI2 = math.pi * 2
+local OUTER_RADIUS = 2.5
+local INNER_RADIUS = 1.4
+local GROUND_OFFSET = 2.8
+
+local lightningColor = ColorSequence.new({
+	ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 255, 255)),
+	ColorSequenceKeypoint.new(0.5, Color3.fromRGB(147, 51, 234)),
+	ColorSequenceKeypoint.new(1, Color3.fromRGB(60, 0, 120)),
+})
+
+--// GUI - Single Button
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "Desyns"
+screenGui.ResetOnSpawn = false
+screenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screenGui.Parent = game:GetService("CoreGui")
+
+local mainBtn = Instance.new("TextButton")
+mainBtn.Name = "DesynsToggle"
+mainBtn.Size = UDim2.new(0, 140, 0, 36)
+mainBtn.Position = UDim2.new(0.5, -70, 0, 8)
+mainBtn.BackgroundColor3 = Color3.fromRGB(15, 0, 30)
+mainBtn.BackgroundTransparency = 0.2
+mainBtn.Text = "Desyns - Aether OFF"
+mainBtn.TextColor3 = Color3.fromRGB(200, 200, 200)
+mainBtn.TextSize = 13
+mainBtn.Font = Enum.Font.GothamBold
+mainBtn.AutoButtonColor = false
+mainBtn.Active = true
+mainBtn.Draggable = true
+mainBtn.Parent = screenGui
+
+local btnCorner = Instance.new("UICorner")
+btnCorner.CornerRadius = UDim.new(0, 10)
+btnCorner.Parent = mainBtn
+
+local btnStroke = Instance.new("UIStroke")
+btnStroke.Color = Color3.fromRGB(147, 51, 234)
+btnStroke.Thickness = 1.5
+btnStroke.Transparency = 0.4
+btnStroke.Parent = mainBtn
+
+local glow = Instance.new("Frame")
+glow.Size = UDim2.new(1, 6, 1, 6)
+glow.Position = UDim2.new(0, -3, 0, -3)
+glow.BackgroundColor3 = Color3.fromRGB(147, 51, 234)
+glow.BackgroundTransparency = 1
+glow.BorderSizePixel = 0
+glow.ZIndex = -1
+glow.Parent = mainBtn
+
+local glowCorner = Instance.new("UICorner")
+glowCorner.CornerRadius = UDim.new(0, 12)
+glowCorner.Parent = glow
+
+--// Button Animations
+mainBtn.MouseEnter:Connect(function()
+	ts:Create(mainBtn, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(40, 10, 80)}):Play()
+	ts:Create(glow, TweenInfo.new(0.2), {BackgroundTransparency = 0.85}):Play()
+end)
+
+mainBtn.MouseLeave:Connect(function()
+	if not desyncActive then
+		ts:Create(mainBtn, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(15, 0, 30)}):Play()
+	else
+		ts:Create(mainBtn, TweenInfo.new(0.2), {BackgroundColor3 = Color3.fromRGB(80, 20, 140)}):Play()
+	end
+	ts:Create(glow, TweenInfo.new(0.2), {BackgroundTransparency = 1}):Play()
+end)
+
+mainBtn.MouseButton1Down:Connect(function()
+	ts:Create(mainBtn, TweenInfo.new(0.1), {BackgroundColor3 = Color3.fromRGB(100, 40, 160)}):Play()
+end)
+
+--// Desync Functions
+local function SetDesync(state)
+	if typeof(rnet) == "table" then
+		pcall(function()
+			if rnet.setdesync then rnet.setdesync(state) end
+			if rnet.desync then rnet.desync(state) end
+			if rnet.enabledesync then rnet.enabledesync(state) end
+		end)
+	end
+	if typeof(delta) == "table" then
+		pcall(function()
+			if delta.raknet_desync then delta.raknet_desync(state) end
+			if delta.desync then delta.desync(state) end
+			if delta.enabledesync then delta.enabledesync(state) end
+		end)
+	end
+end
+
+local function SendFakePosition(position)
+	local cf = CFrame.new(position)
+	if typeof(rnet) == "table" then
+		pcall(function()
+			if rnet.sendphysics then rnet.sendphysics(cf) end
+			if rnet.sendposition then rnet.sendposition(position) end
+			if rnet.setposition then rnet.setposition(position) end
+		end)
+	end
+	if typeof(delta) == "table" then
+		pcall(function()
+			if delta.sendphysics then delta.sendphysics(cf) end
+			if delta.sendposition then delta.sendposition(position) end
+			if delta.setposition then delta.setposition(position) end
+		end)
+	end
+end
+
+local function GetServerPosition()
+	if typeof(delta) == "table" then
+		local ok, pos = pcall(delta.get_server_position)
+		if ok and pos and typeof(pos) == "Vector3" then return pos end
+	end
+	if typeof(rnet) == "table" then
+		local ok, pos = pcall(rnet.get_server_position)
+		if ok and pos and typeof(pos) == "Vector3" then return pos end
+	end
+	return nil
+end
+
+--// RakHook
+local function rakhook(packet)
+	if packet.PacketId == 0x1B then
+		local buf = packet.AsBuffer
+		buffer.writeu32(buf, 1, 0xFFFFFFFF)
+		packet:SetData(buf)
+	end
+end
+
+--// Ghost VFX
+local function removeGhost()
+	if vfxConn then vfxConn:Disconnect() vfxConn = nil end
+	for _, p in ipairs(groundParts) do
+		if p.dot and p.dot.Parent then p.dot:Destroy() end
+	end
+	groundParts = {}
+	attachments = {}
+	if ghostModel then ghostModel:Destroy() ghostModel = nil end
+end
+
+local function makeSparks(parent)
+	local att = Instance.new("Attachment")
+	att.Parent = parent
+	local spk = Instance.new("ParticleEmitter")
+	spk.Color = lightningColor
+	spk.LightEmission = 1
+	spk.LightInfluence = 0
+	spk.Size = NumberSequence.new({
+		NumberSequenceKeypoint.new(0, 0.15),
+		NumberSequenceKeypoint.new(0.5, 0.08),
+		NumberSequenceKeypoint.new(1, 0),
+	})
+	spk.Lifetime = NumberRange.new(0.1, 0.3)
+	spk.Rate = 0
+	spk.Speed = NumberRange.new(8, 25)
+	spk.SpreadAngle = Vector2.new(180, 180)
+	spk.RotSpeed = NumberRange.new(-360, 360)
+	spk.Parent = att
+	return att
+end
+
+local function makeRingDot(px, py, pz, sz, col)
+	local dot = Instance.new("Part")
+	dot.Anchored = true
+	dot.CanCollide = false
+	dot.CanTouch = false
+	dot.CanQuery = false
+	dot.CastShadow = false
+	dot.Size = Vector3.new(sz, sz, sz)
+	dot.Shape = Enum.PartType.Ball
+	dot.Material = Enum.Material.Neon
+	dot.Color = col
+	dot.Transparency = 0
+	dot.CFrame = CFrame.new(px, py, pz)
+	dot.Parent = workspace
+	return dot
+end
+
+local function createGhost(pos)
+	removeGhost()
+	
+	local char = lp.Character
+	if not char then return end
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp then return end
+
+	local offset = pos - hrp.Position
+	char.Archivable = true
+	local ghost = char:Clone()
+	char.Archivable = false
+	if not ghost then return end
+
+	ghost.Name = "DesynsGhost"
+	for _, v in ipairs(ghost:GetDescendants()) do
+		pcall(function()
+			if v:IsA("Script") or v:IsA("LocalScript") or v:IsA("ModuleScript") or v:IsA("Animator") or v:IsA("AnimationController") then
+				v:Destroy()
+			end
+		end)
+	end
+
+	local hum = ghost:FindFirstChildOfClass("Humanoid")
+	if hum then hum:Destroy() end
+
+	for _, v in ipairs(ghost:GetDescendants()) do
+		pcall(function()
+			if v:IsA("BasePart") then
+				v.Anchored = true
+				v.CanCollide = false
+				v.CanTouch = false
+				v.CanQuery = false
+				v.CastShadow = false
+				v.Transparency = 0
+				v.Material = Enum.Material.ForceField
+				v.Color = Color3.fromRGB(20, 0, 40)
+				v.CFrame = v.CFrame + offset
+				if v.Name ~= "HumanoidRootPart" then
+					for e = 1, 2 do
+						table.insert(attachments, makeSparks(v))
+					end
+				end
+			end
+		end)
+	end
+
+	local ghostHRP = ghost:FindFirstChild("HumanoidRootPart")
+	if ghostHRP then
+		ghostHRP.Transparency = 1
+		ghostHRP.CFrame = CFrame.new(pos) * (hrp.CFrame - hrp.CFrame.Position)
+	end
+
+	local hl = Instance.new("Highlight")
+	hl.FillColor = Color3.fromRGB(60, 0, 120)
+	hl.FillTransparency = 0.3
+	hl.OutlineColor = Color3.fromRGB(147, 51, 234)
+	hl.OutlineTransparency = 0
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Adornee = ghost
+	hl.Parent = ghost
+
+	ghost.Parent = workspace
+	ghostModel = ghost
+
+	local rCount = 24
+	local iCount = 16
+	local gy = pos.Y - GROUND_OFFSET
+	local outerCol = Color3.fromRGB(88, 28, 135)
+	local innerCol = Color3.fromRGB(168, 85, 247)
+
+	for i = 1, rCount do
+		local a = (i / rCount) * PI2
+		local dot = makeRingDot(pos.X + math.cos(a) * OUTER_RADIUS, gy, pos.Z + math.sin(a) * OUTER_RADIUS, 0.2, outerCol)
+		table.insert(groundParts, {dot = dot, baseAngle = a, isOuter = true})
+	end
+	for i = 1, iCount do
+		local a = (i / iCount) * PI2
+		local dot = makeRingDot(pos.X + math.cos(a) * INNER_RADIUS, gy, pos.Z + math.sin(a) * INNER_RADIUS, 0.12, innerCol)
+		table.insert(groundParts, {dot = dot, baseAngle = a, isOuter = false})
+	end
+
+	local sparkTimer = 0
+	vfxConn = rs.Heartbeat:Connect(function(dt)
+		if not ghostModel or not ghostModel.Parent then return end
+		
+		local currentServerPos = GetServerPosition()
+		if currentServerPos then
+			serverPos = currentServerPos
+			for _, v in ipairs(ghostModel:GetDescendants()) do
+				if v:IsA("BasePart") and v.Name ~= "HumanoidRootPart" then
+					v.CFrame = CFrame.new(currentServerPos) + (v.Position - ghostModel:GetPivot().Position)
+				end
+			end
+			local gHRP = ghostModel:FindFirstChild("HumanoidRootPart")
+			if gHRP then
+				gHRP.CFrame = CFrame.new(currentServerPos) * (gHRP.CFrame - gHRP.CFrame.Position)
+			end
+		end
+		
+		local t = tick()
+		local pulse = math.abs(math.sin(t * 3))
+		hl.FillColor = Color3.fromRGB(math.floor(40 + pulse * 40), 0, math.floor(100 + pulse * 80))
+		hl.OutlineColor = Color3.fromRGB(math.floor(120 + pulse * 60), 40, 200)
+		hl.OutlineTransparency = pulse * 0.2
+
+		for _, entry in ipairs(groundParts) do
+			if entry.dot and entry.dot.Parent then
+				local radius = entry.isOuter and OUTER_RADIUS or INNER_RADIUS
+				local speed = entry.isOuter and 2.5 or -3.5
+				local a = entry.baseAngle + t * speed
+				local wave = math.abs(math.sin(t * 6 + entry.baseAngle)) * 0.15
+				local bright = math.abs(math.sin(t * 8 + entry.baseAngle)) * 0.35
+				
+				local ringPos = serverPos or pos
+				entry.dot.CFrame = CFrame.new(
+					ringPos.X + math.cos(a) * radius, 
+					gy + wave, 
+					ringPos.Z + math.sin(a) * radius
+				)
+				entry.dot.Transparency = bright
+			end
+		end
+
+		sparkTimer = sparkTimer + dt
+		if sparkTimer >= 0.04 then
+			sparkTimer = 0
+			local numAtts = #attachments
+			if numAtts > 0 then
+				for b = 1, math.random(2, 4) do
+					local pick = attachments[math.random(1, numAtts)]
+					if pick and pick.Parent then
+						local em = pick:FindFirstChildOfClass("ParticleEmitter")
+						if em then em:Emit(math.random(10, 20)) end
+					end
+				end
+			end
+		end
+	end)
+end
+
+--// Main Toggle
+mainBtn.MouseButton1Up:Connect(function()
+	desyncActive = not desyncActive
+	
+	if desyncActive then
+		local char = lp.Character
+		if not char then return end
+		local hrp = char:FindFirstChild("HumanoidRootPart")
+		if not hrp then return end
+		
+		staticPos = hrp.Position
+		
+		SetDesync(true)
+		createGhost(staticPos)
+		
+		if rnet then pcall(function() rnet.add_send_hook(rakhook) end) end
+		
+		desyncConn = rs.Heartbeat:Connect(function()
+			if staticPos then
+				SendFakePosition(staticPos)
+				local offset = Vector3.new(
+					math.random(-2, 2) * 0.1,
+					0,
+					math.random(-2, 2) * 0.1
+				)
+				SendFakePosition(staticPos + offset)
+			end
+		end)
+		
+		mainBtn.Text = "Desyns - Aether ON"
+		mainBtn.BackgroundColor3 = Color3.fromRGB(80, 20, 140)
+		btnStroke.Color = Color3.fromRGB(200, 100, 255)
+		
+	else
+		SetDesync(false)
+		removeGhost()
+		
+		if desyncConn then desyncConn:Disconnect() desyncConn = nil end
+		if rnet then pcall(function() rnet.remove_send_hook(rakhook) end) end
+		
+		staticPos = nil
+		serverPos = nil
+		
+		mainBtn.Text = "Desyns - Aether OFF"
+		mainBtn.BackgroundColor3 = Color3.fromRGB(15, 0, 30)
+		btnStroke.Color = Color3.fromRGB(147, 51, 234)
+	end
+end)
+
+--// Respawn Handler
+lp.CharacterAdded:Connect(function(char)
+	wait(0.3)
+	if desyncActive then
+		local hrp = char:WaitForChild("HumanoidRootPart", 2)
+		if hrp then
+			staticPos = hrp.Position
+			createGhost(staticPos)
+			SetDesync(true)
+		end
+	end
+end)
+
+--// Load
+local notif = Instance.new("Hint")
+notif.Text = "Desyns Pure Desync Loaded"
+notif.Parent = workspace
+game:GetService("Debris"):AddItem(notif, 3)
+
+print("Desyns Pure Desync v1.0 | Invisibility Only")
